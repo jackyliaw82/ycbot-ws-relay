@@ -35,6 +35,13 @@ const UPSTREAM_RECONNECT_MAX_MS = 60_000;
 const UPSTREAM_MAX_RECONNECT_ATTEMPTS = 25;
 const UPSTREAM_IDLE_CLOSE_MS = 30_000; // close upstream when no subscribers for this long
 
+// Streams to keep hot at all times (open at boot, never idle-close, reconnect indefinitely).
+// First subscriber to a warmed stream sees messages immediately — no upstream cold-start.
+const WARM_STREAMS = (process.env.WARM_STREAMS || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
 // Log level: 'debug' | 'info' | 'warn' | 'error'
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
 const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
@@ -64,7 +71,9 @@ function connectUpstream(upstream) {
   upstream.alive = true;
 
   ws.on('open', () => {
-    log('info', `upstream open: ${upstream.stream} (${upstream.subscribers.size} subs)`);
+    upstream.openedAt = Date.now();
+    upstream.firstMessageAt = null;
+    log('info', `upstream open: ${upstream.stream} (${upstream.subscribers.size} subs)${upstream.warmed ? ' [warmed]' : ''}`);
     upstream.reconnectAttempts = 0;
     if (upstream.pingInterval) clearInterval(upstream.pingInterval);
     upstream.pingInterval = setInterval(() => {
@@ -75,6 +84,11 @@ function connectUpstream(upstream) {
   });
 
   ws.on('message', (data) => {
+    if (!upstream.firstMessageAt) {
+      upstream.firstMessageAt = Date.now();
+      const latency = upstream.openedAt ? upstream.firstMessageAt - upstream.openedAt : null;
+      log('info', `upstream first-message: ${upstream.stream} latency=${latency != null ? `${latency}ms` : 'unknown'}`);
+    }
     // Fan-out: forward raw frame to all subscribed clients
     for (const client of upstream.subscribers) {
       if (client.readyState === WebSocket.OPEN) {
@@ -88,22 +102,22 @@ function connectUpstream(upstream) {
   });
 
   ws.on('close', (code, reason) => {
-    log('info', `upstream close: ${upstream.stream} code=${code} reason=${reason || 'none'} subs=${upstream.subscribers.size}`);
+    log('info', `upstream close: ${upstream.stream} code=${code} reason=${reason || 'none'} subs=${upstream.subscribers.size}${upstream.warmed ? ' [warmed]' : ''}`);
     if (upstream.pingInterval) {
       clearInterval(upstream.pingInterval);
       upstream.pingInterval = null;
     }
     upstream.alive = false;
 
-    if (upstream.subscribers.size === 0) {
-      // No subscribers — don't bother reconnecting
+    if (upstream.subscribers.size === 0 && !upstream.warmed) {
+      // No subscribers and not warmed — don't bother reconnecting
       marketUpstreams.delete(upstream.stream);
       return;
     }
 
-    // Reconnect with exponential backoff
+    // Reconnect with exponential backoff. Warmed streams reconnect indefinitely.
     upstream.reconnectAttempts++;
-    if (upstream.reconnectAttempts > UPSTREAM_MAX_RECONNECT_ATTEMPTS) {
+    if (!upstream.warmed && upstream.reconnectAttempts > UPSTREAM_MAX_RECONNECT_ATTEMPTS) {
       log('error', `upstream max reconnect attempts: ${upstream.stream}`);
       // Notify clients so they can reconnect or fall back
       for (const client of upstream.subscribers) {
@@ -141,6 +155,9 @@ function getOrCreateUpstream(stream) {
     pingInterval: null,
     idleCloseTimeout: null,
     alive: false,
+    warmed: false,
+    openedAt: null,
+    firstMessageAt: null,
   };
   marketUpstreams.set(stream, upstream);
   connectUpstream(upstream);
@@ -155,11 +172,12 @@ function handleMarketSubscriber(clientWs, stream) {
   clientWs.on('close', () => {
     upstream.subscribers.delete(clientWs);
     log('info', `client- ${stream} subs=${upstream.subscribers.size}`);
-    if (upstream.subscribers.size === 0) {
-      // Schedule idle close — avoids churn if another client re-subscribes immediately
+    if (upstream.subscribers.size === 0 && !upstream.warmed) {
+      // Schedule idle close — avoids churn if another client re-subscribes immediately.
+      // Warmed streams stay open even with zero subscribers.
       if (upstream.idleCloseTimeout) clearTimeout(upstream.idleCloseTimeout);
       upstream.idleCloseTimeout = setTimeout(() => {
-        if (upstream.subscribers.size === 0) {
+        if (upstream.subscribers.size === 0 && !upstream.warmed) {
           log('info', `upstream idle-close: ${stream}`);
           if (upstream.reconnectTimeout) clearTimeout(upstream.reconnectTimeout);
           if (upstream.pingInterval) clearInterval(upstream.pingInterval);
@@ -235,7 +253,9 @@ const server = http.createServer((req, res) => {
         stream,
         subs: u.subscribers.size,
         alive: u.alive,
+        warmed: u.warmed,
         reconnectAttempts: u.reconnectAttempts,
+        firstMessageLatencyMs: u.openedAt && u.firstMessageAt ? u.firstMessageAt - u.openedAt : null,
       })),
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -271,6 +291,13 @@ wss.on('connection', (ws, req) => {
 
 server.listen(PORT, () => {
   log('info', `ycbot-ws-relay listening on port ${PORT}, upstream=${BINANCE_WS_BASE}`);
+  if (WARM_STREAMS.length > 0) {
+    log('info', `pre-warming ${WARM_STREAMS.length} stream(s): ${WARM_STREAMS.join(', ')}`);
+    for (const stream of WARM_STREAMS) {
+      const upstream = getOrCreateUpstream(stream);
+      upstream.warmed = true;
+    }
+  }
 });
 
 function shutdown(signal) {

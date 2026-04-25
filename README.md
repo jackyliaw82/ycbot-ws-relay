@@ -32,6 +32,11 @@ The relay detects which is which automatically.
 | `PORT` | `8080` | TCP port the relay listens on |
 | `BINANCE_WS_BASE` | `wss://fstream.binance.com/ws` | Upstream Binance WS base URL |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `WARM_STREAMS` | _(empty)_ | Comma-separated list of streams to keep hot at all times. First subscriber sees messages immediately — no upstream cold-start. e.g. `solusdt@markPrice@1s,btcusdt@markPrice@1s`. |
+
+### Why pre-warm?
+
+A bot's first WS to a cold upstream observes a few seconds (sometimes tens of seconds, depending on Binance throttling) of silence while the relay opens its Binance upstream and the first message arrives. Bots with stall-watchdogs interpret this as a dead stream and bounce. Pre-warming keeps the relay's Binance upstream open before any client subscribes, so the bot inherits a hot stream and gets message #1 within milliseconds. The `firstMessageLatencyMs` field on `/health` shows how long the cold-start actually took for each stream.
 
 ## Deploy on a new GCP e2-micro VM (one-time setup)
 
@@ -115,6 +120,13 @@ sudo pm2 save
 sudo pm2 startup systemd -u root --hp /root
 # ^ follow the instruction it prints, typically a sudo env ... pm2 startup ... command
 ```
+
+Refer to the "follow the instruction it prints.., please refer below:
+- My earlier "copy the sudo env line" instruction is outdated — PM2 v6 now executes the systemd setup itself when it's already running as root. That's exactly what happened for you:
+[PM2] [-] Executing: systemctl enable pm2-root...
+Created symlink /etc/systemd/system/multi-user.target.wants/pm2-root.service → /etc/systemd/system/pm2-root.service.
+[PM2] [v] Command successfully executed.
+PM2 already installed and enabled the systemd service. No manual command needed. ****The relay will now auto-start on VM reboot.****
 
 ### 6. Verify
 
