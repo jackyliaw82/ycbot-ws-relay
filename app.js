@@ -34,6 +34,10 @@ const UPSTREAM_RECONNECT_BASE_MS = 1_000;
 const UPSTREAM_RECONNECT_MAX_MS = 60_000;
 const UPSTREAM_MAX_RECONNECT_ATTEMPTS = 25;
 const UPSTREAM_IDLE_CLOSE_MS = 30_000; // close upstream when no subscribers for this long
+// If Binance accepts the WS handshake but never pushes a message (silent throttle / bad
+// stream name / IP rep), close the WS after this long so the close-handler reconnect
+// kicks in. Without this, a silent upstream sits stuck forever (alive=true, never delivers).
+const UPSTREAM_FIRST_MESSAGE_TIMEOUT_MS = 30_000;
 
 // Streams to keep hot at all times (open at boot, never idle-close, reconnect indefinitely).
 // First subscriber to a warmed stream sees messages immediately — no upstream cold-start.
@@ -76,13 +80,20 @@ function connectUpstream(upstream) {
     upstream.openedAt = Date.now();
     upstream.firstMessageAt = null;
     log('info', `upstream open: ${upstream.stream} (${upstream.subscribers.size} subs)${upstream.warmed ? ' [warmed]' : ''}`);
-    upstream.reconnectAttempts = 0;
     if (upstream.pingInterval) clearInterval(upstream.pingInterval);
     upstream.pingInterval = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
         try { ws.ping(); } catch (_) { /* ignore */ }
       }
     }, PING_INTERVAL_MS);
+    // Watchdog: if no message arrives within the timeout, close so close-handler reconnects.
+    if (upstream.firstMessageWatchdog) clearTimeout(upstream.firstMessageWatchdog);
+    upstream.firstMessageWatchdog = setTimeout(() => {
+      if (!upstream.firstMessageAt && ws.readyState === WebSocket.OPEN) {
+        log('warn', `upstream first-message timeout: ${upstream.stream} after ${UPSTREAM_FIRST_MESSAGE_TIMEOUT_MS}ms — closing for retry`);
+        try { ws.close(4001, 'first-message timeout'); } catch (_) { /* ignore */ }
+      }
+    }, UPSTREAM_FIRST_MESSAGE_TIMEOUT_MS);
   });
 
   ws.on('message', (data) => {
@@ -90,6 +101,13 @@ function connectUpstream(upstream) {
       upstream.firstMessageAt = Date.now();
       const latency = upstream.openedAt ? upstream.firstMessageAt - upstream.openedAt : null;
       log('info', `upstream first-message: ${upstream.stream} latency=${latency != null ? `${latency}ms` : 'unknown'}`);
+      if (upstream.firstMessageWatchdog) {
+        clearTimeout(upstream.firstMessageWatchdog);
+        upstream.firstMessageWatchdog = null;
+      }
+      // Reset backoff only on a *productive* connection — receiving a real message.
+      // Resetting on WS-open instead would prevent backoff growth across silent-close cycles.
+      upstream.reconnectAttempts = 0;
     }
     // Fan-out: forward raw frame to all subscribed clients
     for (const client of upstream.subscribers) {
@@ -108,6 +126,10 @@ function connectUpstream(upstream) {
     if (upstream.pingInterval) {
       clearInterval(upstream.pingInterval);
       upstream.pingInterval = null;
+    }
+    if (upstream.firstMessageWatchdog) {
+      clearTimeout(upstream.firstMessageWatchdog);
+      upstream.firstMessageWatchdog = null;
     }
     upstream.alive = false;
 
@@ -156,6 +178,7 @@ function getOrCreateUpstream(stream) {
     reconnectTimeout: null,
     pingInterval: null,
     idleCloseTimeout: null,
+    firstMessageWatchdog: null,
     alive: false,
     warmed: false,
     openedAt: null,
@@ -308,6 +331,7 @@ function shutdown(signal) {
     if (upstream.reconnectTimeout) clearTimeout(upstream.reconnectTimeout);
     if (upstream.pingInterval) clearInterval(upstream.pingInterval);
     if (upstream.idleCloseTimeout) clearTimeout(upstream.idleCloseTimeout);
+    if (upstream.firstMessageWatchdog) clearTimeout(upstream.firstMessageWatchdog);
     if (upstream.ws && upstream.ws.readyState !== WebSocket.CLOSED) {
       try { upstream.ws.close(); } catch (_) { /* ignore */ }
     }
