@@ -37,9 +37,11 @@ const UPSTREAM_IDLE_CLOSE_MS = 30_000; // close upstream when no subscribers for
 
 // Streams to keep hot at all times (open at boot, never idle-close, reconnect indefinitely).
 // First subscriber to a warmed stream sees messages immediately — no upstream cold-start.
+// NOTE: Binance stream names are case-sensitive (`markPrice`, not `markprice`). Trim only —
+// do NOT lowercase, or Binance will accept the WS handshake but never push any messages.
 const WARM_STREAMS = (process.env.WARM_STREAMS || '')
   .split(',')
-  .map(s => s.trim().toLowerCase())
+  .map(s => s.trim())
   .filter(Boolean);
 
 // Log level: 'debug' | 'info' | 'warn' | 'error'
