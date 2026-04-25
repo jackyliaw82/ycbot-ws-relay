@@ -32,11 +32,10 @@ The relay detects which is which automatically.
 | `PORT` | `8080` | TCP port the relay listens on |
 | `BINANCE_WS_BASE` | `wss://fstream.binance.com/ws` | Upstream Binance WS base URL |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
-| `WARM_STREAMS` | _(empty)_ | Comma-separated list of streams to keep hot at all times. First subscriber sees messages immediately — no upstream cold-start. e.g. `solusdt@markPrice@1s,btcusdt@markPrice@1s`. |
 
-### Why pre-warm?
+### Cold-start handling
 
-A bot's first WS to a cold upstream observes a few seconds (sometimes tens of seconds, depending on Binance throttling) of silence while the relay opens its Binance upstream and the first message arrives. Bots with stall-watchdogs interpret this as a dead stream and bounce. Pre-warming keeps the relay's Binance upstream open before any client subscribes, so the bot inherits a hot stream and gets message #1 within milliseconds. The `firstMessageLatencyMs` field on `/health` shows how long the cold-start actually took for each stream.
+The relay opens a Binance upstream lazily on first subscriber. A first-message watchdog (8s) closes any upstream that completes the handshake but never delivers messages — the close-handler then reconnects with exponential backoff. Pre-warming the upstream before the bot subscribes is the responsibility of the bot itself (`POST /ai-hedge/prepare-symbol` opens a discard-only WS to the relay for the user's currently-selected symbol so the upstream is hot when a strategy actually starts). The `firstMessageLatencyMs` field on `/health` shows the real cold-start cost per upstream.
 
 ## Deploy on a new GCP e2-micro VM (one-time setup)
 
