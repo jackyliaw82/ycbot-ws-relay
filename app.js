@@ -61,6 +61,15 @@ function isListenKey(stream) {
   return !stream.includes('@');
 }
 
+// Streams that are *event-driven* and can legitimately be silent for many minutes
+// (forceOrder = liquidations, only emitted when one happens). The first-message
+// watchdog is wrong for these — relying on ping/pong + real close events is the
+// correct posture. Always-on streams (markPrice, ticker, kline, depth) keep the
+// watchdog because for them, silence within 8s is a real "silent-stuck" signal.
+function isSporadicStream(stream) {
+  return stream.includes('@forceOrder');
+}
+
 function connectUpstream(upstream) {
   const url = `${BINANCE_WS_BASE}/${upstream.stream}`;
   log('info', `upstream connecting: ${upstream.stream}`);
@@ -72,20 +81,31 @@ function connectUpstream(upstream) {
     upstream.openedAt = Date.now();
     upstream.firstMessageAt = null;
     log('info', `upstream open: ${upstream.stream} (${upstream.subscribers.size} subs)`);
+    // For sporadic streams (forceOrder), the first-message reset path never
+    // fires — reset reconnectAttempts on successful open instead. The WS
+    // handshake succeeding is itself proof of a healthy connection;
+    // ping/pong covers ongoing health from here.
+    if (isSporadicStream(upstream.stream)) {
+      upstream.reconnectAttempts = 0;
+    }
     if (upstream.pingInterval) clearInterval(upstream.pingInterval);
     upstream.pingInterval = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
         try { ws.ping(); } catch (_) { /* ignore */ }
       }
     }, PING_INTERVAL_MS);
-    // Watchdog: if no message arrives within the timeout, close so close-handler reconnects.
+    // First-message watchdog: only for always-on streams. Sporadic streams
+    // (forceOrder) can legitimately be silent for many minutes — ping/pong
+    // handles stuck-stream detection there.
     if (upstream.firstMessageWatchdog) clearTimeout(upstream.firstMessageWatchdog);
-    upstream.firstMessageWatchdog = setTimeout(() => {
-      if (!upstream.firstMessageAt && ws.readyState === WebSocket.OPEN) {
-        log('warn', `upstream first-message timeout: ${upstream.stream} after ${UPSTREAM_FIRST_MESSAGE_TIMEOUT_MS}ms — closing for retry`);
-        try { ws.close(4001, 'first-message timeout'); } catch (_) { /* ignore */ }
-      }
-    }, UPSTREAM_FIRST_MESSAGE_TIMEOUT_MS);
+    if (!isSporadicStream(upstream.stream)) {
+      upstream.firstMessageWatchdog = setTimeout(() => {
+        if (!upstream.firstMessageAt && ws.readyState === WebSocket.OPEN) {
+          log('warn', `upstream first-message timeout: ${upstream.stream} after ${UPSTREAM_FIRST_MESSAGE_TIMEOUT_MS}ms — closing for retry`);
+          try { ws.close(4001, 'first-message timeout'); } catch (_) { /* ignore */ }
+        }
+      }, UPSTREAM_FIRST_MESSAGE_TIMEOUT_MS);
+    }
   });
 
   ws.on('message', (data) => {
