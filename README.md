@@ -1,16 +1,24 @@
 # ycbot-ws-relay
 
-WebSocket relay between vm-bots and Binance fstream. Removes user VM IPs from Binance's view entirely — only the relay's dedicated static IP talks to Binance. Also fans out public market-data streams so N bots on the same symbol share ONE upstream connection.
+WebSocket relay between vm-bots and Binance fstream. Removes user VM IPs from Binance's view entirely — only the relay's dedicated static IP talks to Binance. Fans out public market-data streams so N bots on the same symbol share ONE upstream connection.
 
-## Architecture
+## Architecture (v1.1.0+)
 
 ```
-[user vm-bots]  ──WS──▶  [ycbot-ws-relay]  ──WS──▶  Binance fstream
+[user vm-bots]  ──WS──▶  [ycbot-ws-relay]  ──single combined-streams WS──▶  Binance fstream
                          (single static IP)
 ```
 
-- **Market data** (`@markPrice@1s`, `@ticker`, `@forceOrder`): one upstream per `(symbol, stream)`, multiplexed to N subscribed bots.
-- **User data** (listenKey-based): 1:1 pass-through (cannot be fanned out — each user has distinct events).
+- **Market data** (`@markPrice@1s`, `@ticker`, `@forceOrder`, `@kline_*`, `@depth`, …): one persistent **combined-streams** upstream to `wss://fstream.binance.com/stream`. Streams are added/removed dynamically via `SUBSCRIBE` / `UNSUBSCRIBE` JSON messages on that single connection. All subscribed clients across all streams share this one upstream — typical relay load is **one upstream per relay process**, not one per stream. Matches Binance's documented best practice and stays well below the 300 connections/IP/5min cap.
+- **User data** (listenKey-based): 1:1 pass-through to `wss://fstream.binance.com/ws/<listenKey>` — cannot be fanned out (each user's events are distinct), but routing via the relay IP still hides the user-VM IP.
+
+### Connection-management posture
+
+- **Pre-emptive 23h30m reconnect** to dodge Binance's 24h forced-disconnect cliff.
+- **Exponential backoff** on close: 1s → 2s → 4s → 8s → 16s → 32s → 60s → 2m → 5m → 30m, capped. Reset on the first DATA frame after a fresh open.
+- **Hard rate cap**: 30 connect attempts per 5 minutes (10× safety margin under Binance's documented 300/5min/IP cap). When the cap is hit, backoff is forced longer until the sliding window clears.
+- **First-DATA-frame watchdog** (8s): catches the silent-stuck handshake pattern where Binance accepts the WS but never pushes data.
+- **Per-stream stale-warning** for chatty streams (`@markPrice`, `@ticker`, `@kline`, `@depth`, `@aggTrade`): logs a warning if a specific stream goes silent for >60s but does NOT auto-recycle the upstream — that's a Binance-side stream-pause, not a connection failure.
 
 ## URL format
 
@@ -23,19 +31,19 @@ The relay detects which is which automatically.
 
 ## Endpoints
 
-- `GET /health` — JSON status with upstream count, subscriber totals, per-stream stats.
+- `GET /health` — JSON status with upstream connection state, recent-attempt count + cap, and per-stream subscriber counts + lastMessageAt.
 
 ## Environment variables
 
 | Var | Default | Purpose |
 |-----|---------|---------|
 | `PORT` | `8080` | TCP port the relay listens on |
-| `BINANCE_WS_BASE` | `wss://fstream.binance.com/ws` | Upstream Binance WS base URL |
+| `BINANCE_WS_BASE_HOST` | `wss://fstream.binance.com` | Upstream Binance host (no `/ws` or `/stream` suffix — the relay appends the right path per channel) |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
 ### Cold-start handling
 
-The relay opens a Binance upstream lazily on first subscriber. A first-message watchdog (8s) closes any upstream that completes the handshake but never delivers messages — the close-handler then reconnects with exponential backoff. Pre-warming the upstream before the bot subscribes is the responsibility of the bot itself (`POST /ai-hedge/prepare-symbol` opens a discard-only WS to the relay for the user's currently-selected symbol so the upstream is hot when a strategy actually starts). The `firstMessageLatencyMs` field on `/health` shows the real cold-start cost per upstream.
+The relay opens its single combined-streams upstream lazily on the first subscriber. A first-DATA-frame watchdog (8s) closes any upstream that completes the handshake + SUBSCRIBE ack but never delivers actual market data — the close-handler then reconnects with exponential backoff. Pre-warming the upstream before the bot subscribes is the responsibility of the bot itself (`POST /ai-hedge/prepare-symbol` opens a discard-only WS to the relay for the user's currently-selected symbol so the upstream is hot when a strategy actually starts). The `marketUpstream.firstDataLatencyMs` field on `/health` shows the real cold-start cost.
 
 ## Deploy on a new GCP e2-micro VM (one-time setup)
 
@@ -184,10 +192,25 @@ Look for `[DIAG] connectRealtimeWebSocket called. ... url=ws://<RELAY_IP>:8080/w
 
 | Failure | Effect | Mitigation |
 |---|---|---|
-| Relay crashes | All vm-bots see WS close → Phase 1 REST fallback triggers on each | PM2 autorestart; monitor `/health`; bot trading continues |
-| Relay's static IP gets banned by Binance | All upstreams fail; bots see silent stall → fallback | Release/re-reserve a new static IP (same runbook as user VM IP swap) |
+| Relay crashes | All vm-bots see WS close → REST fallback triggers on each | PM2 autorestart; monitor `/health`; bot trading continues |
+| Relay's static IP gets silently throttled by Binance for a specific stream | First-DATA watchdog catches it within 8s; backoff kicks in; eventually de-flagged or operator cycles the IP | Exponential backoff + 30/5min rate cap prevents self-inflicted re-throttle. IP-cycle runbook below as last resort. |
+| Relay's static IP gets fully banned by Binance | All upstreams fail; bots see silent stall → REST fallback | Release/re-reserve a new static IP (runbook below) |
+| Binance's 24h forced disconnect | Pre-emptive 23h30m reconnect handles it gracefully — re-subscribes all active streams on the new connection with no data gap | Built-in to the upstream lifecycle (v1.1.0+) |
 | e2-micro VM out of memory | PM2 `max_memory_restart: 200M` in ecosystem config recycles it | Monitor memory usage; upsize to e2-small if real need |
-| Relay can't reach Binance | Upstreams fail to open, bots stall | Watchdog + REST fallback handles the bot side |
+| Relay can't reach Binance (network outage) | Upstream fails to open, backoff escalates up to 30 min | Watchdog + REST fallback handles the bot side; relay reconnects when network restored |
+
+### IP-cycle runbook (when an IP gets flagged despite v1.1.0 mitigations)
+
+```bash
+gcloud compute addresses create ycbot-ws-relay-ip-v2 --region=asia-southeast1
+gcloud compute addresses describe ycbot-ws-relay-ip-v2 --region=asia-southeast1 --format='value(address)'
+gcloud compute instances delete-access-config ycbot-ws-relay --zone=asia-southeast1-b --access-config-name='External NAT'
+gcloud compute instances add-access-config ycbot-ws-relay --zone=asia-southeast1-b --address=<NEW_IP> --access-config-name='External NAT'
+# After 24h of stable operation, release the old reservation:
+# gcloud compute addresses delete ycbot-ws-relay-ip --region=asia-southeast1
+```
+
+Then update `RELAY_WS_URL` in `vm-bot/ecosystem.config.cjs` to point at the new IP, push, and `git pull && pm2 restart ycbot --update-env` on each user VM.
 
 ## Not yet implemented (future work)
 
