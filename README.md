@@ -22,11 +22,11 @@ WebSocket relay between vm-bots and Binance fstream. Removes user VM IPs from Bi
 
 ## URL format
 
-Clients connect to: `ws://<relay-host>:<port>/ws/<stream-or-listenKey>?token=<RELAY_AUTH_TOKEN>`
+Clients connect to: `ws://<relay-host>:<port>/ws/<stream-or-listenKey>?token=<PER_USER_TOKEN>`
 
 - Market stream: anything containing `@` (e.g. `solusdt@markPrice@1s`, `btcusdt@forceOrder`)
 - User-data listenKey: no `@` (e.g. `3HBljNoVsw9NB5iDU5OJI8HyDMNJbTFmMlAmq4G38mXqkwBHQYIIq5JlWv2FXGPl`)
-- `?token=` is required when `RELAY_AUTH_TOKEN` is configured on the relay; clients without the matching token are closed with WS code 1008 (Unauthorized).
+- `?token=` is **required** — valid tokens come from the Firestore collection `relay_auth_tokens`. Backend writes one doc per VM at provision time; relay loads them at startup and live-updates via `onSnapshot`. Clients without a matching token are closed with WS code 1008 (Unauthorized).
 
 The relay detects which is which automatically.
 
@@ -41,7 +41,7 @@ The relay detects which is which automatically.
 | `PORT` | `8080` | TCP port the relay listens on |
 | `BINANCE_WS_BASE_HOST` | `wss://fstream.binance.com` | Upstream Binance host (no `/ws` or `/stream` suffix — the relay appends the right path per channel) |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
-| `RELAY_AUTH_TOKEN` | _(unset)_ | Shared-secret token clients must supply via `?token=...`. When unset, the relay logs a security warning at startup and accepts all connections. **Generate**: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`. **Set via shell env, never hardcode in `ecosystem.config.cjs`** (this repo is public). |
+| `FIREBASE_PROJECT_ID` | `ycbot-6f336` | Firestore project for the `relay_auth_tokens` collection. Relay uses Application Default Credentials — the VM's attached service account must have `roles/datastore.user` on this project. Backend (ycbot-ai backend-service) writes one token doc per VM at provision time; relay loads them at startup and live-updates via `onSnapshot`. If init fails, relay exits (no fallback to permissive mode). |
 
 ### Cold-start handling
 

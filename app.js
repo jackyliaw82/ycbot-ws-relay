@@ -38,15 +38,21 @@
 
 import { WebSocketServer, WebSocket } from 'ws';
 import http from 'http';
-import { timingSafeEqual } from 'crypto';
+import admin from 'firebase-admin';
 
 const PORT = Number(process.env.PORT || 8080);
 
-// Optional shared-secret auth for client connections. When set, clients must
-// include `?token=<RELAY_AUTH_TOKEN>` on the connection URL or get 1008.
-// When unset, the relay logs a security warning at startup and accepts all
-// connections — useful for transition deploys, NOT recommended for production.
-const RELAY_AUTH_TOKEN = process.env.RELAY_AUTH_TOKEN || '';
+// Per-user auth: clients connect with `?token=<TOKEN>`. Valid tokens come from
+// the Firestore collection `relay_auth_tokens` (one doc per VM, written by the
+// backend at provision time, deleted at deprovision). The relay loads the
+// collection at startup and maintains an in-memory cache that's live-updated
+// via Firestore onSnapshot — revocation/rotation propagates within ~1s.
+//
+// FIREBASE_PROJECT_ID env selects the Firestore project. Auth uses Application
+// Default Credentials (the relay VM's attached GCP service account must have
+// roles/datastore.user on this project).
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'ycbot-6f336';
+const RELAY_TOKEN_COLLECTION = 'relay_auth_tokens';
 
 // Base URL for fstream — host only, no /ws or /stream suffix; we append the right
 // one per use case. Override via env for testnet (e.g. wss://stream.binancefuture.com).
@@ -90,15 +96,6 @@ function isListenKey(stream) {
   return !stream.includes('@');
 }
 
-// Constant-time string compare. Falls back to false on length mismatch
-// (timingSafeEqual throws on different-length buffers).
-function timingSafeStringEqual(a, b) {
-  const ab = Buffer.from(String(a));
-  const bb = Buffer.from(String(b));
-  if (ab.length !== bb.length) return false;
-  return timingSafeEqual(ab, bb);
-}
-
 // Extract `?token=...` from a request URL. Returns null if missing.
 function extractTokenFromUrl(reqUrl) {
   if (!reqUrl) return null;
@@ -106,6 +103,66 @@ function extractTokenFromUrl(reqUrl) {
   if (qIdx < 0) return null;
   const params = new URLSearchParams(reqUrl.slice(qIdx + 1));
   return params.get('token');
+}
+
+// ─── Per-user auth via Firestore ─────────────────────────────────────────────
+// In-memory cache: token → uid. Populated at startup from
+// `relay_auth_tokens` collection, kept in sync via onSnapshot listener.
+
+const validTokens = new Map(); // token → uid
+let firestoreReady = false;
+let firestoreInstance = null;
+
+async function initFirebaseAuth() {
+  // Application Default Credentials — the relay VM's attached service account
+  // must have roles/datastore.user on FIREBASE_PROJECT_ID.
+  admin.initializeApp({
+    credential: admin.credential.applicationDefault(),
+    projectId: FIREBASE_PROJECT_ID,
+  });
+  firestoreInstance = admin.firestore();
+  log('info', `firebase-admin initialized (project=${FIREBASE_PROJECT_ID})`);
+
+  // Initial load — block startup until we have the current snapshot, otherwise
+  // the first wave of bot reconnects could race the cache and get rejected.
+  const snapshot = await firestoreInstance.collection(RELAY_TOKEN_COLLECTION).get();
+  for (const doc of snapshot.docs) {
+    const { token, uid } = doc.data();
+    if (token) validTokens.set(token, uid || doc.id);
+  }
+  log('info', `loaded ${validTokens.size} relay-auth token(s) from Firestore`);
+  firestoreReady = true;
+
+  // Live updates. onSnapshot fires once with the existing docs (already loaded
+  // above — we just rebuild from change events) then on every modification.
+  firestoreInstance.collection(RELAY_TOKEN_COLLECTION).onSnapshot((snap) => {
+    for (const change of snap.docChanges()) {
+      const data = change.doc.data();
+      if (change.type === 'removed') {
+        if (data.token && validTokens.has(data.token)) {
+          validTokens.delete(data.token);
+          log('info', `token revoked for uid=${data.uid || change.doc.id}`);
+        }
+      } else {
+        // 'added' or 'modified' — could be a token rotation; remove old token
+        // for this uid first if present, then add new.
+        const newUid = data.uid || change.doc.id;
+        for (const [t, u] of validTokens) {
+          if (u === newUid && t !== data.token) {
+            validTokens.delete(t);
+            log('info', `token rotated for uid=${newUid} (old token invalidated)`);
+            break;
+          }
+        }
+        if (data.token) {
+          validTokens.set(data.token, newUid);
+          if (change.type === 'added') log('info', `token registered for uid=${newUid}`);
+        }
+      }
+    }
+  }, (err) => {
+    log('error', `Firestore listener error: ${err.message}`);
+  });
 }
 
 // "Chatty" streams that should be receiving messages frequently. Used only for
@@ -523,20 +580,28 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
-  // Auth check (only enforced when RELAY_AUTH_TOKEN is configured).
-  if (RELAY_AUTH_TOKEN) {
-    const provided = extractTokenFromUrl(req.url);
-    if (!provided || !timingSafeStringEqual(provided, RELAY_AUTH_TOKEN)) {
-      const safePath = (req.url || '').split('?')[0];
-      log('warn', `rejecting client: bad/missing token on ${safePath}`);
-      ws.close(1008, 'Unauthorized');
-      return;
-    }
+  const safePath = (req.url || '').split('?')[0];
+
+  // Auth check — strict per-user. No cache yet means startup hasn't loaded
+  // tokens, so reject defensively rather than silently accept.
+  if (!firestoreReady) {
+    log('warn', `rejecting client on ${safePath}: token cache not ready (startup race)`);
+    ws.close(1013, 'Service starting');
+    return;
   }
+
+  const provided = extractTokenFromUrl(req.url);
+  if (!provided || !validTokens.has(provided)) {
+    log('warn', `rejecting client on ${safePath}: invalid or missing token`);
+    ws.close(1008, 'Unauthorized');
+    return;
+  }
+  const uid = validTokens.get(provided);
+  log('debug', `client+ uid=${uid} path=${safePath}`);
 
   const match = (req.url || '').match(/^\/ws\/([^/?#]+)/);
   if (!match) {
-    log('warn', `rejecting client with bad path: ${req.url}`);
+    log('warn', `rejecting client with bad path: ${safePath}`);
     ws.close(1008, 'Invalid path');
     return;
   }
@@ -551,14 +616,24 @@ wss.on('connection', (ws, req) => {
 
 // ─── Startup + graceful shutdown ──────────────────────────────────────────────
 
-server.listen(PORT, () => {
-  log('info', `ycbot-ws-relay listening on port ${PORT}, combined-streams=${COMBINED_STREAM_URL}`);
-  if (RELAY_AUTH_TOKEN) {
-    log('info', `auth: RELAY_AUTH_TOKEN configured (clients must include ?token=...)`);
-  } else {
-    log('warn', `[SECURITY] RELAY_AUTH_TOKEN not set — accepting all client connections without auth. Set RELAY_AUTH_TOKEN env to enable.`);
+async function startServer() {
+  try {
+    await initFirebaseAuth();
+  } catch (err) {
+    // Per-user-only mode: if we can't load tokens, EVERY connection would be
+    // rejected. Fail loudly so PM2 logs surface the cause; don't silently
+    // accept-all because that's the security failure we just removed.
+    log('error', `[SECURITY] Failed to initialize Firestore auth: ${err.message}`);
+    log('error', `Relay cannot serve clients without the token cache. Verify the VM service account has roles/datastore.user on ${FIREBASE_PROJECT_ID} and that the relay_auth_tokens collection exists.`);
+    process.exit(1);
   }
-});
+
+  server.listen(PORT, () => {
+    log('info', `ycbot-ws-relay listening on port ${PORT}, combined-streams=${COMBINED_STREAM_URL}`);
+    log('info', `auth: per-user tokens from ${RELAY_TOKEN_COLLECTION} (${validTokens.size} active)`);
+  });
+}
+startServer();
 
 function shutdown(signal) {
   log('info', `received ${signal}, shutting down...`);

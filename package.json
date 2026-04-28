@@ -1,6 +1,6 @@
 {
   "name": "ycbot-ws-relay",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "type": "module",
   "main": "app.js",
   "scripts": {
@@ -12,6 +12,7 @@
     "pm2:logs": "pm2 logs ycbot-ws-relay"
   },
   "dependencies": {
+    "firebase-admin": "^12.7.0",
     "ws": "^8.14.2"
   },
   "engines": {
