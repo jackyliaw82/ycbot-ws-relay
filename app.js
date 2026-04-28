@@ -38,8 +38,15 @@
 
 import { WebSocketServer, WebSocket } from 'ws';
 import http from 'http';
+import { timingSafeEqual } from 'crypto';
 
 const PORT = Number(process.env.PORT || 8080);
+
+// Optional shared-secret auth for client connections. When set, clients must
+// include `?token=<RELAY_AUTH_TOKEN>` on the connection URL or get 1008.
+// When unset, the relay logs a security warning at startup and accepts all
+// connections — useful for transition deploys, NOT recommended for production.
+const RELAY_AUTH_TOKEN = process.env.RELAY_AUTH_TOKEN || '';
 
 // Base URL for fstream — host only, no /ws or /stream suffix; we append the right
 // one per use case. Override via env for testnet (e.g. wss://stream.binancefuture.com).
@@ -81,6 +88,24 @@ function log(level, ...args) {
 function isListenKey(stream) {
   // Binance market streams always contain '@'. Listen keys are ~64-char alnum.
   return !stream.includes('@');
+}
+
+// Constant-time string compare. Falls back to false on length mismatch
+// (timingSafeEqual throws on different-length buffers).
+function timingSafeStringEqual(a, b) {
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+// Extract `?token=...` from a request URL. Returns null if missing.
+function extractTokenFromUrl(reqUrl) {
+  if (!reqUrl) return null;
+  const qIdx = reqUrl.indexOf('?');
+  if (qIdx < 0) return null;
+  const params = new URLSearchParams(reqUrl.slice(qIdx + 1));
+  return params.get('token');
 }
 
 // "Chatty" streams that should be receiving messages frequently. Used only for
@@ -498,6 +523,17 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
+  // Auth check (only enforced when RELAY_AUTH_TOKEN is configured).
+  if (RELAY_AUTH_TOKEN) {
+    const provided = extractTokenFromUrl(req.url);
+    if (!provided || !timingSafeStringEqual(provided, RELAY_AUTH_TOKEN)) {
+      const safePath = (req.url || '').split('?')[0];
+      log('warn', `rejecting client: bad/missing token on ${safePath}`);
+      ws.close(1008, 'Unauthorized');
+      return;
+    }
+  }
+
   const match = (req.url || '').match(/^\/ws\/([^/?#]+)/);
   if (!match) {
     log('warn', `rejecting client with bad path: ${req.url}`);
@@ -517,6 +553,11 @@ wss.on('connection', (ws, req) => {
 
 server.listen(PORT, () => {
   log('info', `ycbot-ws-relay listening on port ${PORT}, combined-streams=${COMBINED_STREAM_URL}`);
+  if (RELAY_AUTH_TOKEN) {
+    log('info', `auth: RELAY_AUTH_TOKEN configured (clients must include ?token=...)`);
+  } else {
+    log('warn', `[SECURITY] RELAY_AUTH_TOKEN not set — accepting all client connections without auth. Set RELAY_AUTH_TOKEN env to enable.`);
+  }
 });
 
 function shutdown(signal) {
