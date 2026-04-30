@@ -1,17 +1,21 @@
 /**
  * ycbot-ws-relay — WebSocket relay between vm-bots and Binance fstream.
  *
- * Architecture (v1.1.0+, combined-streams):
+ * Architecture (v1.4.0+, combined-streams with routed paths):
  *  - One persistent combined-streams upstream WebSocket per relay process to
- *    `wss://fstream.binance.com/stream`. Streams are subscribed/unsubscribed
- *    dynamically via JSON SUBSCRIBE / UNSUBSCRIBE messages on that single
- *    connection. This matches Binance's documented best practice
- *    ("Combined streams are an efficient way to subscribe to multiple data
- *    streams through a single WebSocket connection") and stays well below
- *    the 300-connections-per-IP-per-5-min cap.
+ *    `wss://fstream.binance.com/market/stream`. The `/market` path is REQUIRED
+ *    per Binance Futures docs (2026): "Connections that do not include a
+ *    routed path will only receive data from the Public endpoint." A bare
+ *    `/stream` URL completes the WS handshake and ACKs SUBSCRIBE messages
+ *    silently — but pushes zero market-data frames. Spent 3 days in 2026-04
+ *    misdiagnosing this as IP throttling before the user found `/market/`
+ *    while testing wscat patterns.
+ *  - Streams subscribed/unsubscribed dynamically via JSON SUBSCRIBE /
+ *    UNSUBSCRIBE messages on that single connection. Stays well below the
+ *    300-connections-per-IP-per-5-min cap.
  *  - User-data WS (per-user listenKey) is still 1:1 — each user gets their own
- *    upstream — but routed via the relay IP to keep user-VM IPs out of
- *    Binance's view.
+ *    upstream at `wss://fstream.binance.com/private/ws/<listenKey>` — routed
+ *    via the relay IP to keep user-VM IPs out of Binance's view.
  *  - Bots fan out via the relay: many bots subscribed to the same stream share
  *    one upstream subscription.
  *
@@ -54,13 +58,22 @@ const PORT = Number(process.env.PORT || 8080);
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'ycbot-6f336';
 const RELAY_TOKEN_COLLECTION = 'relay_auth_tokens';
 
-// Base URL for fstream — host only, no /ws or /stream suffix; we append the right
-// one per use case. Override via env for testnet (e.g. wss://stream.binancefuture.com).
+// Base URL for fstream — host only, no path suffix; we append the right routed
+// path per use case. Override via env for testnet (e.g. wss://stream.binancefuture.com).
+//
+// Routed paths per Binance Futures WebSocket docs (2026):
+//   /market — market data (markPrice, ticker, kline, aggTrade, forceOrder, depth)
+//   /private — user-data (listenKey)
+//   /public — high-frequency public (not used by us)
+// Connections without a routed path only receive data from the Public endpoint.
+// Pre-v1.4.0 used a bare `/stream` upstream which silently delivered no market
+// data even though SUBSCRIBE was acked — 3-day debugging arc misdiagnosed as
+// throttling before the user found the routing requirement.
 const BINANCE_WS_BASE_HOST = process.env.BINANCE_WS_BASE_HOST || 'wss://fstream.binance.com';
 // Combined-streams endpoint: opens with no streams, manages subscriptions via JSON.
-const COMBINED_STREAM_URL = `${BINANCE_WS_BASE_HOST}/stream`;
-// Per-listenKey user-data endpoint pattern.
-const userDataUpstreamUrl = (listenKey) => `${BINANCE_WS_BASE_HOST}/ws/${listenKey}`;
+const COMBINED_STREAM_URL = `${BINANCE_WS_BASE_HOST}/market/stream`;
+// Per-listenKey user-data endpoint pattern (private route).
+const userDataUpstreamUrl = (listenKey) => `${BINANCE_WS_BASE_HOST}/private/ws/${listenKey}`;
 
 // Heartbeat
 const PING_INTERVAL_MS = 30_000;
