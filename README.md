@@ -45,7 +45,7 @@ The relay detects which is which automatically.
 
 ### Cold-start handling
 
-The relay opens its single combined-streams upstream lazily on the first subscriber. A first-DATA-frame watchdog (8s) closes any upstream that completes the handshake + SUBSCRIBE ack but never delivers actual market data — the close-handler then reconnects with exponential backoff. Pre-warming the upstream before the bot subscribes is the responsibility of the bot itself (`POST /ai-hedge/prepare-symbol` opens a discard-only WS to the relay for the user's currently-selected symbol so the upstream is hot when a strategy actually starts). The `marketUpstream.firstDataLatencyMs` field on `/health` shows the real cold-start cost.
+The relay opens its single combined-streams upstream lazily on the first subscriber. A first-DATA-frame watchdog (8s) closes any upstream that completes the handshake + SUBSCRIBE ack but never delivers actual market data — the close-handler then reconnects with exponential backoff. Pre-warming the upstream before the bot subscribes is the responsibility of the bot itself (`POST /ai-reversal/prepare-symbol` opens a discard-only WS to the relay for the user's currently-selected symbol so the upstream is hot when a strategy actually starts). The `marketUpstream.firstDataLatencyMs` field on `/health` shows the real cold-start cost.
 
 ## Deploy on a new GCP e2-micro VM (one-time setup)
 
